@@ -773,8 +773,16 @@
 
     // ====================== IMDb MODULE ======================
 
-    let titleMap = new Map(), imdbHistory = null;
+    let titleMap = new Map(), imdbHistory = null, imdbFindBlock = null;
     const resetTitleMap = () => { titleMap = new Map(); };
+
+    function blockFromFindStatus(status) {
+        if (typeof status !== 'number' || status < 500) return null;
+        const err = new Error(`IMDb find HTTP ${status}`);
+        err.code = 'IMDB_FIND_UNAVAILABLE';
+        err.status = status;
+        return err;
+    }
 
     function registerTitle(id, title, orig, year) {
         const add = raw => {
@@ -889,12 +897,17 @@
     }
 
     async function searchIMDbFallback(title, year) {
+        if (imdbFindBlock) throw imdbFindBlock;
         const cacheKey = `imdb:${normTitle(title)}|${year || ''}`;
         return dedupeFetch(cacheKey, async () => {
+            if (imdbFindBlock) throw imdbFindBlock;
             const qs = [title, ...(hasCyr(title) ? [translit(title)] : [])];
             for (const q of qs) {
                 for (const ttype of ['ft', 'tv']) {
+                    if (imdbFindBlock) throw imdbFindBlock;
                     const r = await fetchT(`https://www.imdb.com/find/?q=${encodeURIComponent(q)}&s=tt&ttype=${ttype}`);
+                    const block = blockFromFindStatus(r?.status);
+                    if (block) { imdbFindBlock = block; throw block; }
                     if (!r?.ok) continue;
                     const html = await r.text();
                     const ids = [...new Set([...html.matchAll(/\/title\/(tt\d+)/g)].map(m => m[1]))];
@@ -951,8 +964,10 @@
 
     async function imdbProcess(items, rated, watched, statusEl, deep, mode) {
         Object.assign(kpProbe, makeProbe());
+        imdbFindBlock = null;
         const resolved = [];
         let cur = 0;
+        let findStopped = null;
         while (cur < items.length) {
             const slice = items.slice(cur, cur + kpProbe.c);
             setStatus(statusEl, `Поиск ${cur + 1}–${Math.min(cur + kpProbe.c, items.length)}/${items.length}${dots()}`);
@@ -960,18 +975,34 @@
             const res = await asyncPool(kpProbe.c, slice, i =>
                 i.ttId && /^tt\d+$/.test(i.ttId) ? Promise.resolve(i.ttId) : resolveIMDb(i.title, i.year, deep)
             );
+            const held = [];
+            let blocked = null;
             let fail = false;
             res.forEach((r, j) => {
+                if (r.status === 'rejected' && r.reason?.code === 'IMDB_FIND_UNAVAILABLE') {
+                    blocked = r.reason;
+                    held.push(slice[j]);
+                    return;
+                }
                 const ttId = r.status === 'fulfilled' ? r.value : null;
                 resolved.push({ item: slice[j], ttId });
                 if (!ttId && deep) fail = true;
             });
+            if (blocked) {
+                findStopped = { status: blocked.status, unchecked: held.concat(items.slice(cur + slice.length)) };
+                break;
+            }
             cur += kpProbe.c;
             const elapsed = Date.now() - t0;
             fail ? probeFail(kpProbe) : probeOk(kpProbe, elapsed);
             if (cur < items.length) await sleep(Math.max(30, elapsed < 300 ? 30 : 60));
         }
-        return imdbApplyPhase(resolved, rated, watched, statusEl, mode, items.length);
+        const result = await imdbApplyPhase(resolved, rated, watched, statusEl, mode, items.length);
+        if (findStopped) {
+            result.findStopped = { status: findStopped.status, unchecked: findStopped.unchecked.length };
+            result.missed.push(...findStopped.unchecked);
+        }
+        return result;
     }
 
     function renderIMDbResult(result, statusEl, rated, watched, mode) {
@@ -982,22 +1013,31 @@
             ['Пропущено: ', result.skipped],
             ['Не найдено: ', result.notFound],
             ['Ошибок: ', result.failed],
-        ], result.notFound === 0 && result.failed === 0 ? '🎉 Все записи импортированы!' : null);
+        ], result.notFound === 0 && result.failed === 0 && !result.findStopped ? '🎉 Все записи импортированы!' : null);
+        if (result.findStopped) {
+            statusEl.appendChild(document.createElement('br'));
+            statusEl.appendChild(document.createElement('br'));
+            statusEl.appendChild(document.createTextNode(
+                `Глубокий поиск остановлен: страница imdb.com/find вернула HTTP ${Number(result.findStopped.status)}. Скрипт читает HTML этой страницы, отдельного справочника идентификаторов на этом шаге нет. Ответ 5xx сам по себе не доказывает лимит запросов. Повтор той же кнопки эти адреса не лечит. Уже поставленные оценки не откатываются. Не опрошено: ${result.findStopped.unchecked}. Дальше заполните колонку TtId из публичного набора title.basics и импортируйте CSV снова.`
+            ));
+        }
         if (result.missed.length) {
             downloadCSV(buildCSV(result.missed), 'imdb_missed.csv');
-            const btn = Object.assign(document.createElement('button'), {
-                id: 'mrs-retry',
-                className: 'mrs-btn mrs-btn--yellow',
-                textContent: `🔍 Искать глубже (${result.missed.length})`,
-            });
-            btn.addEventListener('click', async () => {
-                setStatus(statusEl, `Глубокий поиск${dots()}`);
-                const r2 = await imdbProcess(result.missed, rated, watched, statusEl, true, mode);
-                renderIMDbResult(r2, statusEl, rated, watched, mode);
-            });
-            statusEl.appendChild(document.createElement('br'));
-            statusEl.appendChild(document.createElement('br'));
-            statusEl.appendChild(btn);
+            if (!result.findStopped) {
+                const btn = Object.assign(document.createElement('button'), {
+                    id: 'mrs-retry',
+                    className: 'mrs-btn mrs-btn--yellow',
+                    textContent: `🔍 Искать глубже (${result.missed.length})`,
+                });
+                btn.addEventListener('click', async () => {
+                    setStatus(statusEl, `Глубокий поиск${dots()}`);
+                    const r2 = await imdbProcess(result.missed, rated, watched, statusEl, true, mode);
+                    renderIMDbResult(r2, statusEl, rated, watched, mode);
+                });
+                statusEl.appendChild(document.createElement('br'));
+                statusEl.appendChild(document.createElement('br'));
+                statusEl.appendChild(btn);
+            }
         }
     }
 

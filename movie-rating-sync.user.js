@@ -95,7 +95,7 @@
         async function next() {
             while (index < items.length) {
                 const i = index++;
-                const promise = worker(items[i], i).then(
+                const promise = Promise.resolve(worker(items[i], i)).then(
                     r => ({ status: 'fulfilled', value: r }),
                     e => ({ status: 'rejected', reason: e })
                 );
